@@ -277,6 +277,7 @@
             searchQuery: '',
             currentTab: 'home',
             isOnline: navigator.onLine,
+            dbConnected: false,
             isInitialLoad: true,
             currentUserUid: null,
             appId: typeof __app_id !== 'undefined' ? __app_id : 'pricebook-app-v1'
@@ -338,6 +339,11 @@
 
         // UI Helpers
         function showToast(message, type = 'info') {
+            // Prevent toast spam by limiting concurrent toasts
+            if (DOM.toastContainer.children.length >= 3) {
+                DOM.toastContainer.firstElementChild.remove();
+            }
+
             const toast = document.createElement('div');
             const bgClass = type === 'success' ? 'bg-emerald-600' : (type === 'error' ? 'bg-red-600' : 'bg-slate-800');
             toast.className = `toast ${bgClass} text-white px-4 py-3 rounded-xl shadow-lg flex items-center gap-3 text-sm font-medium w-full`;
@@ -441,10 +447,11 @@
 
         function updateSyncStatus() {
             state.isOnline = navigator.onLine;
-            DOM.connectionIndicator.className = state.isOnline 
+            const isSynced = state.isOnline && state.dbConnected;
+            DOM.connectionIndicator.className = isSynced 
                 ? "w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" 
                 : "w-2.5 h-2.5 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.6)]";
-            DOM.connectionIndicator.title = state.isOnline ? "Online" : "Offline";
+            DOM.connectionIndicator.title = isSynced ? "Online & Synced" : "Local Mode";
             if (state.currentTab === 'info') renderInfo();
         }
 
@@ -587,9 +594,14 @@
             state.products.forEach(p => { if (p.category) categoriesSet.add(p.category.trim()); });
             const catCount = categoriesSet.size;
             
-            const syncUI = state.isOnline 
-                ? `<span class="inline-flex items-center text-xs text-emerald-700 bg-emerald-100 px-2.5 py-1 rounded-md font-bold tracking-wide"><span class="w-2 h-2 rounded-full bg-emerald-500 mr-2 animate-pulse"></span>ONLINE</span>`
-                : `<span class="inline-flex items-center text-xs text-amber-700 bg-amber-100 px-2.5 py-1 rounded-md font-bold tracking-wide"><span class="w-2 h-2 rounded-full bg-amber-500 mr-2"></span>OFFLINE</span>`;
+            let syncUI = '';
+            if (state.isOnline && state.dbConnected) {
+                syncUI = `<span class="inline-flex items-center text-xs text-emerald-700 bg-emerald-100 px-2.5 py-1 rounded-md font-bold tracking-wide"><span class="w-2 h-2 rounded-full bg-emerald-500 mr-2 animate-pulse"></span>SYNCED</span>`;
+            } else if (state.isOnline && !state.dbConnected) {
+                syncUI = `<span class="inline-flex items-center text-xs text-amber-700 bg-amber-100 px-2.5 py-1 rounded-md font-bold tracking-wide"><span class="w-2 h-2 rounded-full bg-amber-500 mr-2"></span>LOCAL MODE</span>`;
+            } else {
+                syncUI = `<span class="inline-flex items-center text-xs text-slate-700 bg-slate-100 px-2.5 py-1 rounded-md font-bold tracking-wide"><span class="w-2 h-2 rounded-full bg-slate-500 mr-2"></span>OFFLINE</span>`;
+            }
 
             DOM.infoContent.innerHTML = `
                 <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 mb-5 overflow-hidden relative">
@@ -615,11 +627,11 @@
                 <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
                     <h2 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">About App</h2>
                     <p class="text-sm text-slate-600 leading-relaxed mb-4">
-                        PriceBook automatically syncs prices across all connected devices in real-time. 
+                        PriceBook automatically syncs prices across all connected devices in real-time when connected to the database.
                     </p>
                     <div class="bg-blue-50 text-blue-800 text-xs p-3 rounded-xl border border-blue-100 flex items-start gap-2">
                         <svg class="w-4 h-4 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                        <p>Changes will sync automatically between all your authorized users instantly.</p>
+                        <p>If you are in Local Mode, changes will only be saved to your device's memory.</p>
                     </div>
                 </div>
             `;
@@ -768,11 +780,6 @@
                 return;
             }
 
-            if(!authObj || !authObj.currentUser) {
-                showToast("Not authenticated. Cannot save.", "error");
-                return;
-            }
-
             const id = document.getElementById('item-id').value || generateId();
             const name = document.getElementById('item-name').value.trim();
             const type = DOM.pricingType.value;
@@ -784,7 +791,7 @@
                 pricingType: type,
                 isPinned: document.getElementById('item-pinned').checked,
                 lastUpdated: Date.now(),
-                lastUpdatedBy: state.currentUserUid
+                lastUpdatedBy: state.currentUserUid || 'local-user'
             };
 
             if (type === 'single') {
@@ -797,39 +804,59 @@
                 itemData.priceLate = Number(document.getElementById('item-price-late').value) || 0;
             }
 
-            try {
-                // Mandatory Rule 1: Strict public path mapping
-                const docRef = doc(db, 'artifacts', state.appId, 'public', 'data', 'products', id);
-                
-                // Set button state to loading
-                const btn = DOM.saveItemBtn;
-                const origText = btn.textContent;
-                btn.innerHTML = '<svg class="animate-spin h-5 w-5 mx-auto text-white" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>';
-                btn.disabled = true;
+            if (state.dbConnected && authObj && authObj.currentUser) {
+                try {
+                    // Mandatory Rule 1: Strict public path mapping
+                    const docRef = doc(db, 'artifacts', state.appId, 'public', 'data', 'products', id);
+                    
+                    // Set button state to loading
+                    const btn = DOM.saveItemBtn;
+                    const origText = btn.textContent;
+                    btn.innerHTML = '<svg class="animate-spin h-5 w-5 mx-auto text-white" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>';
+                    btn.disabled = true;
 
-                await setDoc(docRef, itemData);
+                    await setDoc(docRef, itemData);
+                    
+                    closeModal(DOM.formModal);
+                    showToast("Product saved successfully", "success");
+                } catch (error) {
+                    console.error("Save error:", error);
+                    showToast("Failed to save product", "error");
+                } finally {
+                    DOM.saveItemBtn.textContent = 'Save Product';
+                    DOM.saveItemBtn.disabled = false;
+                }
+            } else {
+                // Local Mode Fallback
+                const existingIdx = state.products.findIndex(p => p.id === id);
+                if(existingIdx >= 0) state.products[existingIdx] = itemData;
+                else state.products.push(itemData);
                 
+                state.products.sort((a,b) => a.name.localeCompare(b.name));
+                updateCategoryDatalist();
+                renderCurrentTab();
                 closeModal(DOM.formModal);
-                showToast("Product saved successfully", "success");
-            } catch (error) {
-                console.error("Save error:", error);
-                showToast("Failed to save product", "error");
-            } finally {
-                DOM.saveItemBtn.textContent = 'Save Product';
-                DOM.saveItemBtn.disabled = false;
+                showToast("Product saved locally", "success");
             }
         }
 
         async function deleteProduct(id) {
-            if(!authObj || !authObj.currentUser) return;
-            try {
-                const docRef = doc(db, 'artifacts', state.appId, 'public', 'data', 'products', id);
-                await deleteDoc(docRef);
+            if (state.dbConnected && authObj && authObj.currentUser) {
+                try {
+                    const docRef = doc(db, 'artifacts', state.appId, 'public', 'data', 'products', id);
+                    await deleteDoc(docRef);
+                    closeModal(DOM.viewModal);
+                    showToast("Product deleted", "info");
+                } catch (error) {
+                    console.error("Delete error:", error);
+                    showToast("Failed to delete", "error");
+                }
+            } else {
+                // Local Mode Fallback
+                state.products = state.products.filter(p => p.id !== id);
+                renderCurrentTab();
                 closeModal(DOM.viewModal);
-                showToast("Product deleted", "info");
-            } catch (error) {
-                console.error("Delete error:", error);
-                showToast("Failed to delete", "error");
+                showToast("Product deleted locally", "info");
             }
         }
 
@@ -845,6 +872,10 @@
                     } catch(e) {
                         console.warn("Could not parse __firebase_config, relying on defaults if available.");
                     }
+                }
+                
+                if (Object.keys(firebaseConfig).length === 0) {
+                    throw new Error("Missing Firebase configuration");
                 }
 
                 const app = initializeApp(firebaseConfig);
@@ -863,6 +894,7 @@
                 }
                 
                 state.currentUserUid = authObj.currentUser.uid;
+                state.dbConnected = true;
 
                 // Mandatory Rule 2: No Complex Queries. Fetch all, sort in JS.
                 const productsRef = collection(db, 'artifacts', state.appId, 'public', 'data', 'products');
@@ -889,23 +921,24 @@
                     state.products.sort((a,b) => a.name.localeCompare(b.name));
                     
                     state.isInitialLoad = false;
+                    updateSyncStatus();
                     updateCategoryDatalist();
                     renderCurrentTab();
                     
                 }, (error) => {
                     console.error("Sync Error:", error);
-                    showToast("Error syncing with database", "error");
-                    DOM.homeContent.innerHTML = `<div class="text-center py-10 text-red-500">Failed to load data. Please refresh.</div>`;
+                    state.dbConnected = false;
+                    updateSyncStatus();
+                    showToast("Error syncing with database, working locally", "error");
                 });
 
             } catch (error) {
                 console.error("Initialization Error:", error);
-                DOM.homeContent.innerHTML = `
-                    <div class="text-center py-12 px-6 flex flex-col items-center">
-                        <svg class="w-12 h-12 text-slate-300 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-                        <h3 class="text-lg font-bold text-slate-700 mb-1">Connection Offline</h3>
-                        <p class="text-sm text-slate-500">The application failed to initialize the database connection. Please check your network and refresh.</p>
-                    </div>`;
+                state.dbConnected = false;
+                state.isInitialLoad = false;
+                updateSyncStatus();
+                renderCurrentTab();
+                showToast("Working in Local Mode", "info");
             }
         }
 
